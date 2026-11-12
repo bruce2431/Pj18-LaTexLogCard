@@ -92,6 +92,12 @@
     parent.postMessage({ type: 'floria-pv-event', ev: 'src-open', path: path, line: line }, '*');
     return true;
   }
+  // 请宿主在原文里标红报错片段（半透明底）。marks 为空 = 清掉上一批标记。
+  function emitSrcMark(path, marks) {
+    if (!EMBEDDED) return false;
+    parent.postMessage({ type: 'floria-pv-event', ev: 'src-mark', path: path, marks: marks || [] }, '*');
+    return true;
+  }
   let toastTimer = null;
   function lgToast(text) {
     let el = $('lg-toast');
@@ -111,66 +117,206 @@
      分块编译的报错写的是块文件（.build/floria/chunks/ch1.tex:42），行号是块内行号：
      块第 1 行 = main.tex 第 chunk.line 行，平移回去。wrapper.tex 装的是导言区，
      行号与 main.tex 一一对应。 */
+  function mainPath() {
+    return S.book + '/' + (S.tex || 'main.tex');
+  }
+  function baseOf(file) {
+    return String(file).replace(/\\/g, '/').split('/').pop().toLowerCase();
+  }
   function locFor(file, line) {
     const ln = parseInt(line, 10) || 0;
     if (!ln || !S.book) return null;
-    const base = String(file).replace(/\\/g, '/').split('/').pop().toLowerCase();
-    const path = S.book + '/' + (S.tex || 'main.tex');
-    if (base === 'main.tex' || base === 'wrapper.tex') return { path: path, line: ln };
+    const base = baseOf(file);
+    if (base === 'main.tex' || base === 'wrapper.tex') return { path: mainPath(), line: ln };
     const hit = S.chunks.find(c => String(c.name || '').toLowerCase() === base);
-    if (hit) return { path: path, line: ln + (hit.line || 1) - 1 };
+    if (hit) return { path: mainPath(), line: ln + (hit.line || 1) - 1, ck: hit.name };
     return null;
+  }
+  // 块在 main.tex 里的行范围 [起, 止]（止取下一块起点或全文末行，重叠一行无妨）
+  function chunkRange(name) {
+    if (!name) return null;
+    const i = S.chunks.findIndex(c => String(c.name || '').toLowerCase() === String(name).toLowerCase());
+    if (i < 0) return null;
+    const start = S.chunks[i].line || 1;
+    const end = i + 1 < S.chunks.length ? (S.chunks[i + 1].line || start)
+      : (srcLines && srcLines.length ? srcLines.length : start);
+    return [start, end];
   }
 
   /* 把日志原文按行画进容器：`.tex:行号:` 与紧跟着的 `l.行号` 渲染成可点片段。
      其余文本原样保留，容器仍是等宽 pre-wrap。 */
   const TEX_LOC = /^(.+?\.tex):(\d+):/;
   const L_LOC = /^l\.(\d+)(?=\s|$)/;
+  const INPUT_RE = /\\input\{[^}]*chunks[\\/]([^\\/]+?)\.tex\}/;
   // 报错行：`!` 开头，或以 `文件:行:` 开头而尾部就是 TeX 的报错文案
   const ERR_LOC = /^(?:!|Emergency stop|Fatal error occurred)/;
-  const ERR_TAIL = /(Missing \$ inserted|Undefined control sequence|Emergency stop|Fatal error occurred|Runaway argument|! LaTeX Error|! Package |! Class |Extra \}|Too many \}|Misplaced)/;
-  function paintLog(el, text) {
+  // 日志逐行扫描：定位（可点行号）与报错判定只做一遍，画日志与「原文标红」共用同一份结果。
+  function scanLog(text) {
     const rows = String(text == null ? '' : text).split('\n');
-    const frag = document.createDocumentFragment();
+    const out = [];
     let lastFile = '';       // 上一行的 `文件:行:` 里的文件：`l.N` 的行号属于同一个文件
     let prevErr = false;     // 上一行是报错：紧随的 `l.N`（出错位置）也标成报错
+    let prevMsg = '';        // 报错文案：`l.N` 行自身只有源码摘录，沿用上一条
+    let wrapItem = null;     // 最近的 wrapper.tex 报错行：等后面的 `l.N \input{…}` 补出块位置
     rows.forEach(row => {
-      const line = document.createElement('div');
-      line.className = 'll';
       let loc = null, head = '';
       const m = TEX_LOC.exec(row);
+      const l = m ? null : L_LOC.exec(row);
       if (m) {
         lastFile = m[1];
         loc = locFor(m[1], m[2]);
         head = m[0];
-      } else {
-        const l = L_LOC.exec(row);
-        if (l && lastFile) {
-          loc = locFor(lastFile, l[1]);     // `l.N` 的 N 也是块内行号，要同样平移
+      } else if (l && lastFile) {
+        const inp = INPUT_RE.exec(row);
+        if (inp) {
+          // wrapper.tex 的报错落在 `\input{chunks/X.tex}` 那行 = 读到该块文件末尾才出错，
+          // 归到该块在 main.tex 的末行；紧上的 wrapper 报错行同样改用它。
+          const ck = inp[1] + '.tex';
+          const rng = chunkRange(ck);
+          loc = rng ? { path: mainPath(), line: rng[1], ck: ck } : null;
+          if (wrapItem) wrapItem.loc = loc;
+          wrapItem = null;
+          head = l[0];
+        } else if (baseOf(lastFile) === 'wrapper.tex') {
+          loc = null;                      // wrapper 的其它 l.N 行不直接对 main.tex
+          head = l[0];
+        } else {
+          loc = locFor(lastFile, l[1]);    // `l.N` 的 N 也是块内行号，要同样平移
           head = l[0];
         }
       }
-      const err = ERR_LOC.test(row)
-        || (loc != null && ERR_TAIL.test(row.slice(head.length)))
-        || (prevErr && /^l\.\d+/.test(row));
-      if (loc) {
+      // `-file-line-error` 下只有报错才会写 `文件:行:` 格式（警告走「on input line」），
+      // 故 TEX_LOC 命中即报错；`!` 开头的通用错误与紧随的 `l.N` 位置行同样算。
+      const err = ERR_LOC.test(row) || m != null || (prevErr && /^l\.\d+/.test(row));
+      let msg = '';
+      if (err) {
+        if (m) msg = row.slice(head.length).trim() || prevMsg;
+        else if (l) msg = prevMsg || row.trim();
+        else msg = row.trim();
+        if (msg) prevMsg = msg;
+      }
+      const item = { row: row, loc: loc, head: head, err: err, msg: msg };
+      out.push(item);
+      if (m) wrapItem = baseOf(m[1]) === 'wrapper.tex' ? item : null;
+      prevErr = err;
+    });
+    return out;
+  }
+
+  /* ---------------- 报错行校正 ----------------
+     TeX 报的 `文件:行:` 是**检出位置**，不是出错位置：多数错误（缺 $、括号不配对等）
+     要读到段末才报，行号落在段落后的空行上，直接据此标红就会整体向下偏移。
+     这里拿当前 main.tex 校正：空行先回退到段落最后一行；数学类报错再按段内 `$` 奇偶
+     找真正打开却没闭合的那一行。TeX 报错文案跟着错误行传进来，判断用得上。 */
+  let srcLines = null;                              // 当前书稿 main.tex 的行数组
+  async function loadSrc() {
+    if (srcLines) return srcLines;
+    try {
+      const d = await api('api/read?book=' + encodeURIComponent(S.book));
+      srcLines = String((d && d.text) || '').split('\n');
+    } catch (e) { srcLines = []; }
+    return srcLines;
+  }
+  const MATH_ERR = /Missing \$ inserted|Missing \$|Extra \$|Unbalanced|Display math should end|Math formula incomplete|Missing \\right|Missing \{/;
+  // 括号/环境不配对：TeX 在「读到该块文件末尾 / 段落末尾」才报，行号落在收尾行上。
+  // 这一段按块范围扫未闭合的 `{` 与 `\begin{…}`，把标记挪回真正开头的条件那行。
+  function scanUnclosed(a, b) {
+    const lines = srcLines || [];
+    const env = [];          // {name, line}
+    const brace = [];        // 未闭合 { 所在行
+    for (let j = Math.max(1, a); j <= Math.min(b, lines.length); j++) {
+      const t = String(lines[j - 1] || '')
+        .replace(/\\[{}%]/g, '\u0000')       // \{ \} \% 不算括号/注释
+        .replace(/%.*$/, '');
+      let mm;
+      const reB = /\\begin\{([^}]*)\}/g;
+      while ((mm = reB.exec(t))) env.push({ name: mm[1], line: j });
+      const reE = /\\end\{([^}]*)\}/g;
+      while ((mm = reE.exec(t))) {
+        for (let i = env.length - 1; i >= 0; i--) {
+          if (env[i].name === mm[1]) { env.length = i; break; }
+        }
+      }
+      for (const ch of t) {
+        if (ch === '{') brace.push(j);
+        else if (ch === '}' && brace.length) brace.pop();
+      }
+    }
+    if (env.length) return env[env.length - 1].line;
+    if (brace.length) return brace[brace.length - 1];
+    return 0;
+  }
+  function refineLine(n, msg, ck) {
+    const lines = srcLines;
+    if (!lines || !lines.length || !(n > 0)) return n;
+    // 先查未配对的 `{` / `\begin{…}`：正常源文这段扫描不会有命中，命中即真凶。
+    // （TeX 的多行报错文案在日志里会折行截断，不能只靠关键字判断。）
+    const r = chunkRange(ck) || [1, lines.length];
+    const hit = scanUnclosed(r[0], r[1]);
+    if (hit && hit <= n) return hit;
+    let k = Math.min(n, lines.length);              // 报错行常在段末空行上
+    while (k > 1 && !String(lines[k - 1] || '').trim()) k--;
+    if (!MATH_ERR.test(msg || '')) return k;
+    let start = k;                                  // 段落起点：上一空行的下一行
+    while (start > 1 && String(lines[start - 2] || '').trim()) start--;
+    let par = 0;
+    for (let j = start; j <= k; j++) {
+      const t = String(lines[j - 1] || '').replace(/\\\$/g, '');
+      const odd = ((t.match(/\$/g) || []).length % 2 === 1);
+      const before = par;
+      par ^= odd ? 1 : 0;
+      if (!before && par) return j;                 // 这一行开了 $ 没闭合
+    }
+    return k;
+  }
+
+  function paintLog(el, text) {
+    const frag = document.createDocumentFragment();
+    scanLog(text).forEach(item => {
+      const line = document.createElement('div');
+      line.className = 'll';
+      if (item.loc) {
+        const ln = item.err ? refineLine(item.loc.line, item.msg, item.loc.ck) : item.loc.line;
         const a = document.createElement('span');
         a.className = 'lg-link';
-        a.textContent = head;
-        a.dataset.path = loc.path;
-        a.dataset.line = String(loc.line);
-        a.title = '跳到 ' + loc.path.split('/').pop() + ' 第 ' + loc.line + ' 行';
+        a.textContent = item.head;
+        a.dataset.path = item.loc.path;
+        a.dataset.line = String(ln);
+        a.title = '跳到 ' + item.loc.path.split('/').pop() + ' 第 ' + ln + ' 行';
         line.appendChild(a);
-        line.appendChild(document.createTextNode(row.slice(head.length)));
+        line.appendChild(document.createTextNode(item.row.slice(item.head.length)));
       } else {
-        line.textContent = row;
+        line.textContent = item.row;
       }
-      if (err) line.classList.add('err');
-      prevErr = err;
+      if (item.err) line.classList.add('err');
       frag.appendChild(line);
     });
     el.textContent = '';
     el.appendChild(frag);
+  }
+
+  /* 报错行 → 原文行范围（同一文件按行去重，最多 50 行）。
+     只取本次记录里真正判为报错、且能定位到源文件的行；主 .tex 单文件时 path 恒为它。 */
+  function marksForRecord(rec) {
+    if (!rec || rec.ok) return [];
+    const byPath = new Map();
+    scanLog(rec.log).forEach(item => {
+      if (!item.err || !item.loc) return;
+      const path = item.loc.path;
+      if (!byPath.has(path)) byPath.set(path, new Map());
+      const lines = byPath.get(path);
+      const n = refineLine(item.loc.line, item.msg, item.loc.ck);   // TeX 报的是检出位置，校正到真正出错行
+      if (!lines.has(n)) lines.set(n, item.msg || '编译报错');
+      else if (!lines.get(n)) lines.set(n, item.msg || '编译报错');
+    });
+    let best = null;
+    byPath.forEach((lines, path) => {
+      if (!best || lines.size > best.lines.size) best = { path: path, lines: lines };
+    });
+    if (!best) return [];
+    return Array.from(best.lines, kv => ({ l0: kv[0], l1: kv[0], msg: kv[1] }))
+      .sort((a, b) => a.l0 - b.l0)
+      .slice(0, 50);
   }
   document.addEventListener('click', e => {
     const a = e.target && e.target.closest && e.target.closest('.lg-link');
@@ -260,16 +406,6 @@
     $('lg-list').innerHTML = '<div class="lg-empty"><p class="le-title">' + esc(title) + '</p>' +
       (hint ? '<p class="le-hint">' + esc(hint) + '</p>' : '') + '</div>';
   }
-  function renderBanner() {
-    const el = $('lg-banner');
-    const p = S.payload;
-    if (p && p.error) {
-      el.textContent = '本次编译失败：' + p.error;
-      el.classList.remove('hidden');
-    } else {
-      el.classList.add('hidden');
-    }
-  }
   function metaOf(e) {
     const bits = ['<span>' + esc(fmtStamp(e.ts)) + '</span>'];
     bits.push('<span' + (e.elapsed == null ? ' title="这次编译的耗时没有记录（多为由磁盘回溯的旧编译）"' : '') +
@@ -310,10 +446,31 @@
       row.querySelector('.log-head').addEventListener('click', () => toggleRow(row));
     });
   }
+  let lastMarkKey = '';
+  // 清掉原文标红（下一次编译开始即调用）。
+  function clearMarks() {
+    if (!S.book) return;
+    lastMarkKey = '';
+    emitSrcMark(S.book + '/' + (S.tex || 'main.tex'), []);
+  }
+  // 某条记录 → 宿主原文标红（空标记 = 清掉上一批）。同一条记录重复展开不重发。
+  function markRecord(rec) {
+    if (!rec || !S.book) return;
+    const path = S.book + '/' + (S.tex || 'main.tex');
+    const marks = marksForRecord(rec);
+    const key = path + '|' + (rec.ts || '') + '|' + (marks.length ? 'x' : '0');
+    if (key === lastMarkKey) return;
+    lastMarkKey = key;
+    emitSrcMark(path, marks);
+  }
   function toggleRow(row, forceOpen) {
     const body = row.querySelector('.log-body');
     if (!body) return;
     const open = forceOpen === undefined ? body.classList.contains('hidden') : !!forceOpen;
+    if (open) {
+      const idx = parseInt(row.dataset.idx, 10);
+      markRecord(S.recs[idx]);   // 展开哪次编译，就让原文跟着标哪次的报错
+    }
     // 手风琴：同时只展开一条，打开新的自动收起旧的
     if (open) {
       $('lg-list').querySelectorAll('.log-item.open').forEach(other => {
@@ -359,9 +516,9 @@
     if (payload) S.payload = payload;
     const name = await resolveBook(S.payload);
     if (my !== seq) return;                         // 期间又发起了新的装载
+    if (name !== S.book) srcLines = null;           // 换书稿：源文缓存作废
     S.book = name;
     $('lg-book').textContent = name || '未识别书稿';
-    renderBanner();
     if (!name) {
       S.recs = [];
       renderEmpty('没有可显示的书稿', '还没有编译记录：先在 PDF 卡里打开一篇论文并点「编译」。');
@@ -380,9 +537,25 @@
     const records = (hr && hr.records) || [];
     S.recs = records.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
     S.newestTs = S.recs.length ? Math.max.apply(null, S.recs.map(r => r.ts || 0)) : 0;
+    // 编译卡带来的 payload 只对那一次失败有效：之后账本出现更新的记录（又编了一轮），
+    // 旧 payload 作废，改为跟随最新一条——否则会一直展开/标红上一轮。
+    if (S.payload && S.payload.ts && S.recs.length && (S.recs[0].ts || 0) > S.payload.ts + 1) {
+      const newest = S.recs[0];
+      S.payload = newest.ok ? null : {
+        book: name,
+        path: S.book + '/' + (hr.tex || S.tex || 'main.tex'),
+        error: newest.error || '',
+        ts: newest.ts,
+      };
+    }
     S.loaded = true;
+    // 校正报错行要读当前 main.tex（空行回退 / $ 奇偶定位）
+    if (S.recs.some(r => r && !r.ok)) await loadSrc();
+    if (my !== seq) return;
     render();
     autoExpand();
+    // 不是「刚从 PDF 卡失败切过来」时，默认跟随最新一次编译：失败就标红原文，通过就清掉上一批。
+    if (!(S.payload && S.payload.ts)) markRecord(S.recs[0]);
   }
 
   /* 自动跟随编译：编译中每 2.5s 探一次；刚结束 / 出现新记录就自动重载。
@@ -397,7 +570,11 @@
     catch (e) { return; }
     if (!hr) return;
     const busy = !!(hr.compile && hr.compile.status === 'busy');
-    if (busy) { wasBusy = true; return; }
+    if (busy) {
+      if (!wasBusy) clearMarks();   // 重新编译一开始就撤掉上一轮标红
+      wasBusy = true;
+      return;
+    }
     if (wasBusy) { wasBusy = false; load(null); return; }
     const recs = hr.records || [];
     const newest = recs.length ? Math.max.apply(null, recs.map(r => r.ts || 0)) : 0;

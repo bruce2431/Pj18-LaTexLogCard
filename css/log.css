@@ -108,21 +108,6 @@ button { font-family: inherit; cursor: pointer; }
 }
 #lg-refresh { margin-left: auto; }
 
-/* ---------------- 失败横幅 ---------------- */
-.lg-banner {
-  flex: 0 0 auto;
-  margin: 12px 18px 0;
-  padding: 10px 14px;
-  background: var(--bg-soft);
-  border: 1px solid var(--border-soft);
-  border-left: 2px solid var(--ink);
-  border-radius: 8px;
-  font-size: 12.5px;
-  color: var(--ink);
-  line-height: 1.65;
-  word-break: break-word;
-}
-
 /* ---------------- 列表 ---------------- */
 .lg-list {
   flex: 1 1 auto;
